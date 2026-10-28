@@ -1,4 +1,6 @@
 import os
+os.environ["GIT_PYTHON_REFRESH"] = "quiet"
+
 import tempfile
 import logging
 from contextlib import asynccontextmanager
@@ -37,9 +39,12 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing Multi-Agent Codebase Navigator...")
     if len(neo4j_service._in_memory_nodes) == 0:
         logger.info("Empty graph detected. Generating and indexing sample enterprise architecture.")
-        sample_dir = os.path.join(tempfile.gettempdir(), "navigator_sample_codebase")
-        create_sample_codebase(sample_dir)
-        ingest_service.ingest_repository(sample_dir, clear_existing=False)
+        try:
+            sample_dir = os.path.join(tempfile.gettempdir(), "navigator_sample_codebase")
+            create_sample_codebase(sample_dir)
+            ingest_service.ingest_repository(sample_dir, clear_existing=False)
+        except Exception as e:
+            logger.warning("Could not auto-seed sample codebase during startup: %s", str(e))
     yield
     neo4j_service.close()
     logger.info("Shutdown completed.")

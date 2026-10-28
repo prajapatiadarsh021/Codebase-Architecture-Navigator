@@ -1,11 +1,20 @@
 import os
+os.environ["GIT_PYTHON_REFRESH"] = "quiet"
+
+import io
 import re
 import shutil
 import tempfile
 import logging
+import zipfile
+import urllib.request
 from typing import Dict, List, Any, Optional
 
-import git
+try:
+    import git
+except Exception:
+    git = None
+
 from dotenv import load_dotenv
 
 from app.core.config import settings
@@ -30,10 +39,59 @@ def is_git_url(path: str) -> bool:
         or "bitbucket.org/" in cleaned
     )
 
-def clone_with_gitpython(git_url: str) -> str:
+def download_github_zip(git_url: str) -> Optional[str]:
     """
-    Clones a remote git repository using GitPython with shallow depth.
-    Safely handles Windows file locks and temp directories.
+    Downloads and extracts a public GitHub repository without requiring git binary.
+    Works in serverless environments like Vercel.
+    """
+    match = re.search(r"github\.com[/:]([\w.-]+)/([\w.-]+?)(?:\.git)?(?:/|$)", git_url)
+    if not match:
+        return None
+    owner, repo = match.group(1), match.group(2)
+    clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{owner}_{repo}")
+    target_dir = os.path.join(tempfile.gettempdir(), f"navigator_zip_{clean_name}")
+
+    if os.path.exists(target_dir):
+        try:
+            shutil.rmtree(target_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    os.makedirs(target_dir, exist_ok=True)
+    zip_urls = [
+        f"https://api.github.com/repos/{owner}/{repo}/zipball",
+        f"https://github.com/{owner}/{repo}/archive/refs/heads/main.zip",
+        f"https://github.com/{owner}/{repo}/archive/refs/heads/master.zip"
+    ]
+
+    for z_url in zip_urls:
+        try:
+            logger.info("Downloading GitHub zip: %s", z_url)
+            req = urllib.request.Request(
+                z_url,
+                headers={"User-Agent": "Codebase-Architecture-Navigator", "Accept": "application/vnd.github.v3+json"}
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                if resp.status == 200:
+                    zip_bytes = resp.read()
+                    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                        zf.extractall(target_dir)
+
+                    items = os.listdir(target_dir)
+                    if len(items) == 1 and os.path.isdir(os.path.join(target_dir, items[0])):
+                        extracted_root = os.path.join(target_dir, items[0])
+                    else:
+                        extracted_root = target_dir
+                    logger.info("Successfully extracted GitHub repo to %s", extracted_root)
+                    return extracted_root
+        except Exception as e:
+            logger.warning("GitHub zip download failed for %s: %s", z_url, str(e))
+
+    return None
+
+def clone_with_git(git_url: str) -> str:
+    """
+    Fallback to GitPython clone if git binary is present.
     """
     url = git_url.strip()
     if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("git@"):
@@ -55,17 +113,30 @@ def clone_with_gitpython(git_url: str) -> str:
         try:
             shutil.rmtree(target_dir, onerror=handle_remove_readonly)
         except Exception:
-            # Fallback to unique directory if Windows locks existing directory
             import time
             target_dir = os.path.join(tempfile.gettempdir(), f"navigator_repo_{clean_name}_{int(time.time())}")
 
-    logger.info("GitPython: Cloning repository from %s into %s", url, target_dir)
     try:
+        if git is None:
+            raise RuntimeError("Git binary or GitPython is not available on this server environment.")
+        logger.info("GitPython: Cloning repository from %s into %s", url, target_dir)
         git.Repo.clone_from(url, target_dir, depth=1)
         return target_dir
     except Exception as e:
-        logger.error("GitPython clone failed: %s", str(e))
+        logger.error("Git clone failed: %s", str(e))
         raise ValueError(f"Git clone failed: {str(e)}")
+
+def fetch_or_clone_repository(git_url: str) -> str:
+    """
+    Fetches a repository using pure HTTP zipball download for GitHub (zero git dependencies),
+    or falls back to git clone if available.
+    """
+    if "github.com" in git_url.lower():
+        extracted = download_github_zip(git_url)
+        if extracted:
+            return extracted
+
+    return clone_with_git(git_url)
 
 class CodebaseIngestService:
     def __init__(self):
@@ -94,14 +165,14 @@ class CodebaseIngestService:
     def ingest_repository(self, target_input: str, clear_existing: bool = True) -> Dict[str, Any]:
         """
         Ingests codebase from a GitHub URL or local directory.
-        1. Clones repository via GitPython if a Git URL is provided.
+        1. Downloads or clones repository.
         2. Parses Python, JavaScript, and TypeScript files into AST.
         3. Populates Neo4j graph nodes and directed relationships.
         4. Generates Gemini text-embedding-004 embeddings and indexes into Qdrant.
         """
         raw_target = target_input.strip()
         if is_git_url(raw_target):
-            work_dir = clone_with_gitpython(raw_target)
+            work_dir = fetch_or_clone_repository(raw_target)
         else:
             work_dir = raw_target
 
