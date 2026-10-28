@@ -186,16 +186,17 @@ const App = () => {
       });
 
       let data = {};
+      let rawText = '';
       try {
-        const text = await res.text();
-        data = text ? JSON.parse(text) : {};
+        rawText = await res.text();
+        data = rawText ? JSON.parse(rawText) : {};
       } catch {
         data = {};
       }
 
       if (!res.ok) {
         throw new Error(
-          data.detail || `Ingestion failed (${res.status}: ${res.statusText || 'Backend server may be offline'})`
+          data.detail || (rawText && rawText.length < 150 ? rawText : `Server error (${res.status}: ${res.statusText || 'Backend timeout or error'})`)
         );
       }
 

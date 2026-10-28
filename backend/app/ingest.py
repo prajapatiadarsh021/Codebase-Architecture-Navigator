@@ -33,6 +33,7 @@ def is_git_url(path: str) -> bool:
 def clone_with_gitpython(git_url: str) -> str:
     """
     Clones a remote git repository using GitPython with shallow depth.
+    Safely handles Windows file locks and temp directories.
     """
     url = git_url.strip()
     if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("git@"):
@@ -51,7 +52,12 @@ def clone_with_gitpython(git_url: str) -> str:
                 func(path)
             except Exception:
                 pass
-        shutil.rmtree(target_dir, onerror=handle_remove_readonly)
+        try:
+            shutil.rmtree(target_dir, onerror=handle_remove_readonly)
+        except Exception:
+            # Fallback to unique directory if Windows locks existing directory
+            import time
+            target_dir = os.path.join(tempfile.gettempdir(), f"navigator_repo_{clean_name}_{int(time.time())}")
 
     logger.info("GitPython: Cloning repository from %s into %s", url, target_dir)
     try:
@@ -89,7 +95,7 @@ class CodebaseIngestService:
         """
         Ingests codebase from a GitHub URL or local directory.
         1. Clones repository via GitPython if a Git URL is provided.
-        2. Parses Python files into AST using Tree-sitter.
+        2. Parses Python, JavaScript, and TypeScript files into AST.
         3. Populates Neo4j graph nodes and directed relationships.
         4. Generates Gemini text-embedding-004 embeddings and indexes into Qdrant.
         """
@@ -110,15 +116,18 @@ class CodebaseIngestService:
         self._init_gemini_embeddings()
 
         parsed_files: List[Dict[str, Any]] = []
+        supported_exts = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+        ignored_dirs = {
+            ".git", "__pycache__", "node_modules", ".venv", "venv", ".idea", 
+            "dist", "build", ".next", ".vscode", "coverage", "android", "gradle"
+        }
 
         for dirpath, dirnames, filenames in os.walk(work_dir):
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in {".git", "__pycache__", "node_modules", ".venv", "venv", ".idea", "dist", "build"}
-            ]
+            dirnames[:] = [d for d in dirnames if d.lower() not in ignored_dirs]
 
             for fname in filenames:
-                if fname.endswith(".py"):
+                _, ext = os.path.splitext(fname)
+                if ext.lower() in supported_exts:
                     full_path = os.path.join(dirpath, fname)
                     rel_path = os.path.relpath(full_path, work_dir).replace("\\", "/")
                     try:
@@ -128,6 +137,12 @@ class CodebaseIngestService:
                         parsed_files.append(parsed)
                     except Exception as e:
                         logger.warning("Error parsing %s: %s", full_path, str(e))
+
+        if not parsed_files:
+            raise ValueError(
+                f"No supported code files found in repository. "
+                "Supported formats: Python (.py), JavaScript (.js, .jsx), TypeScript (.ts, .tsx)."
+            )
 
         all_functions_by_name: Dict[str, List[str]] = {}
         all_classes_by_name: Dict[str, str] = {}
@@ -199,14 +214,25 @@ class CodebaseIngestService:
             # Module Imports
             for imp in pf["imports"]:
                 mod = imp.get("module") or ""
+                clean_mod = mod.lstrip("./").lstrip("@/").replace("\\", "/")
                 possible_file_ids = [
+                    f"file::{mod}",
                     f"file::{mod}.py",
+                    f"file::{clean_mod}",
+                    f"file::{clean_mod}.ts",
+                    f"file::{clean_mod}.tsx",
+                    f"file::{clean_mod}.js",
+                    f"file::{clean_mod}.jsx",
+                    f"file::{clean_mod}/index.ts",
+                    f"file::{clean_mod}/index.tsx",
+                    f"file::{clean_mod}/index.js",
                     f"file::{mod.replace('.', '/')}.py",
                     f"file::{mod}/__init__.py"
                 ]
                 for p_id in possible_file_ids:
                     if p_id in neo4j_service._in_memory_nodes:
                         neo4j_service.add_relationship(file_id, p_id, "IMPORTS")
+                        break
 
         # Pass 2: Connect CALLS relationships
         for pf in parsed_files:
